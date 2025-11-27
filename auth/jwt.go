@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -8,7 +9,14 @@ import (
 
 // SecretKey is used for signing the JWTs.
 // In a real application, this MUST be read from an environment variable or secure vault.
-const SecretKey = "a_very_secret_key_that_should_be_in_env"
+var SecretKey = os.Getenv("JWT_SECRET")
+
+func init() {
+	if SecretKey == "" {
+		// This is a safety check. The Makefile ensures it's set locally.
+		panic("JWT_SECRET environment variable is not set!")
+	}
+}
 
 // Claims defines the structure for the JWT payload
 type Claims struct {

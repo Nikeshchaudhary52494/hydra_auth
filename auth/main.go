@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -15,7 +16,11 @@ var DB *sql.DB
 
 func main() {
 	// --- 1. Database Connection ---
-	connStr := "postgres://postgres:postgres123@localhost:5432/hydra?sslmode=disable" // **Adjust this string!**
+	connStr := os.Getenv("DB_URL") // Read from environment
+	if connStr == "" {
+		log.Fatal("DB_URL environment variable is not set.")
+	}
+
 	var err error
 	DB, err = sql.Open("postgres", connStr)
 	if err != nil {
@@ -34,7 +39,10 @@ func main() {
 	router.HandleFunc("/auth/login", LoginHandler)
 
 	// --- 3. Start Server ---
-	port := ":8080"
+	port := os.Getenv("AUTH_SERVICE_PORT")
+	if port == "" {
+		port = ":8080" // Default if not set
+	}
 	server := &http.Server{
 		Addr:         port,
 		Handler:      router,
