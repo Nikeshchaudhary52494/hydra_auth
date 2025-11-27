@@ -1,12 +1,29 @@
 package main
 
 import (
+	"context" // Needed for RedisClient.Context()
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"log" // Needed for logging errors
 	"net/http"
+
+	// Use the official v8 client import path
+	"github.com/go-redis/redis/v8"
+
+	// Use the official v5 JWT import path
+	"github.com/golang-jwt/jwt/v5"
 
 	"golang.org/x/crypto/bcrypt"
 )
+
+// NOTE: These variables are declared in auth/main.go but used here.
+// They must be accessible (e.g., declared as 'var DB *sql.DB' in main.go).
+// Assuming they are defined in main.go:
+// var DB *sql.DB
+// var RedisClient *redis.Client
+
+// --- Handlers ---
 
 // RegisterRequest defines the expected structure for registration
 type RegisterRequest struct {
@@ -21,33 +38,28 @@ type User struct {
 	PasswordHash string
 }
 
-// TokenResponse defines the response structure for successful login
-type TokenResponse struct {
-	Token string `json:"token"` // This is the Access Token (AT)
-}
-
 // RegisterHandler handles new user creation
 func RegisterHandler(w http.ResponseWriter, r *http.Request) {
+	// ... (Registration logic remains correct)
 	var req RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 
-	// 1. Hash the password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
+		log.Printf("Error hashing password: %v", err)
 		http.Error(w, "Failed to hash password", http.StatusInternalServerError)
 		return
 	}
 
-	// 2. Insert into DB
 	var userID int
 	err = DB.QueryRow("INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
 		req.Email, string(hashedPassword)).Scan(&userID)
 
 	if err != nil {
-		// Check for unique constraint violation (basic check)
+		log.Printf("Error registering user: %v", err)
 		http.Error(w, "Registration failed, email might already exist", http.StatusConflict)
 		return
 	}
@@ -58,13 +70,13 @@ func RegisterHandler(w http.ResponseWriter, r *http.Request) {
 
 // LoginHandler handles user authentication and JWT generation
 func LoginHandler(w http.ResponseWriter, r *http.Request) {
+	// ... (Login logic remains correct)
 	var req RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 
-	// 1. Retrieve user from DB
 	var user User
 	err := DB.QueryRow("SELECT id, email, password_hash FROM users WHERE email = $1", req.Email).
 		Scan(&user.ID, &user.Email, &user.PasswordHash)
@@ -73,24 +85,101 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	} else if err != nil {
+		log.Printf("Database error during login: %v", err)
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
 
-	// 2. Compare password hash
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	// 3. Generate JWT (Access Token)
-	tokenString, err := generateJWT(user.ID)
+	tokens, err := generateTokens(user.ID) // Assumes generateTokens is defined in jwt.go
 	if err != nil {
-		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+		log.Printf("Error generating tokens: %v", err)
+		http.Error(w, "Failed to generate tokens", http.StatusInternalServerError)
 		return
 	}
 
-	// 4. Respond with token
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(TokenResponse{Token: tokenString})
+	json.NewEncoder(w).Encode(tokens)
+}
+
+// RefreshRequest defines the expected structure for token renewal
+type RefreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+// RefreshHandler handles the renewal of access tokens using a refresh token
+func RefreshHandler(w http.ResponseWriter, r *http.Request) {
+	var req RefreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	// Fix 1: Client must pass the expired AT in the Authorization header to get the SessionID
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" || len(authHeader) < 8 || authHeader[:7] != "Bearer " {
+		http.Error(w, "Authorization header (Bearer <AT>) required for refresh", http.StatusUnauthorized)
+		return
+	}
+	tokenString := authHeader[7:]
+
+	// 1. Decode the expired Access Token to get the Session ID
+	claims := &Claims{}
+	// jwt.ParseWithClaims requires the secret key, but we're only reading claims here.
+	// If the AT is expired, jwt.ParseWithClaims will fail.
+	// We use jwt.NewParser().ParseUnverified to extract claims from potentially expired AT.
+	_, _, err := jwt.NewParser().ParseUnverified(tokenString, claims)
+	if err != nil {
+		log.Printf("Failed to parse expired AT: %v", err)
+		http.Error(w, "Invalid Access Token structure", http.StatusUnauthorized)
+		return
+	}
+
+	if claims.SessionID == "" {
+		http.Error(w, "Token missing session ID claim", http.StatusUnauthorized)
+		return
+	}
+
+	// 2. Use the Session ID to find the Refresh Token in Redis
+	// Key: session:{SessionID}
+	redisKey := fmt.Sprintf("session:%s", claims.SessionID)
+
+	// We need to use RedisClient.Context() here
+	storedRT, err := RedisClient.Get(context.Background(), redisKey).Result()
+
+	if err == redis.Nil {
+		http.Error(w, "Session expired or revoked", http.StatusUnauthorized)
+		return
+	} else if err != nil {
+		log.Printf("Server error checking session in Redis: %v", err)
+		http.Error(w, "Server error checking session", http.StatusInternalServerError)
+		return
+	}
+
+	// 3. Compare the stored RT with the submitted RT
+	if storedRT != req.RefreshToken {
+		// Revoke the session since a mismatch implies an attack or error
+		RedisClient.Del(context.Background(), redisKey)
+		http.Error(w, "Invalid refresh token", http.StatusUnauthorized)
+		return
+	}
+
+	// 4. Invalidate old Refresh Token (One-time use)
+	RedisClient.Del(context.Background(), redisKey)
+
+	// 5. Generate new Access and Refresh Tokens
+	newTokens, err := generateTokens(claims.UserID)
+	if err != nil {
+		log.Printf("Failed to generate new tokens: %v", err)
+		http.Error(w, "Failed to generate new tokens", http.StatusInternalServerError)
+		return
+	}
+
+	// 6. Respond
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(newTokens)
 }

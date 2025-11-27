@@ -5,15 +5,22 @@ SERVICE_NAME = hydra-auth
 AUTH_DIR = auth
 AUTH_PKG = ./auth
 PROTO_DIR = proto
+PROTO_FILES = $(wildcard $(PROTO_DIR)/*.proto)
 MIGRATION_DIR = migrations
 # Migration tool
 MIGRATE = migrate
+OUT_DIR = pb
+
+PROTOC_GEN_GO := $(shell which protoc-gen-go)
+PROTOC_GEN_GO_GRPC := $(shell which protoc-gen-go-grpc)
 
 # Include environment variables from .env file
 include .env
 export DB_URL
 export JWT_SECRET
 export AUTH_SERVICE_PORT
+export REDIS_ADDR
+export GRPC_AUTH_PORT
 
 # --- Core Commands ---
 
@@ -26,9 +33,18 @@ run: ## Run the Auth service
 
 # --- Protobuf & gRPC ---
 
-proto: ## Generate Go code from Protobuf files
-	@echo "Generating Protobuf code..."
-	protoc --go_out=. --go-grpc_out=. $(PROTO_DIR)/auth.proto
+proto:
+	@if [ -z "$(PROTOC_GEN_GO)" ] || [ -z "$(PROTOC_GEN_GO_GRPC)" ]; then \
+		echo "Installing protoc-gen-go and protoc-gen-go-grpc..."; \
+		go install google.golang.org/protobuf/cmd/protoc-gen-go@latest; \
+		go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest; \
+	fi
+	@echo "Generating Go code from .proto files..."
+	 @protoc --proto_path=$(PROTO_DIR) \
+        --go_out=$(OUT_DIR) \
+        --go-grpc_out=$(OUT_DIR) \
+        $(PROTO_FILES)
+
 
 # --- Database Migrations ---
 
